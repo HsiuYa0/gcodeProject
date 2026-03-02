@@ -1,0 +1,8 @@
+streamlit
+vtracer
+svg_to_gcode
+Pillow
+numpy
+scikit-image
+svgelements
+shapely
