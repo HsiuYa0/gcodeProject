@@ -302,10 +302,10 @@ class SVGConverter:
 # --- 1. 機器資料庫配置 ---
 MACHINE_DATABASE = {
     "請選擇機器...": {"width": 0, "height": 0, "depth": 0, "modes": [], "default_power": 0},
-    "Cubiio X": {
-        "width": 1800, "height": 600, "depth": 35, "modes": [WorkMode.LASER, WorkMode.CNC], "default_power": 255,
-    },
-    "Cubiio X8": {
+    # "Cubiio X": {
+    #     "width": 1800, "height": 600, "depth": 35, "modes": [WorkMode.LASER, WorkMode.CNC], "default_power": 255,
+    # },
+    "GORDIX": {
         "width": 2280, "height": 1060, "depth": 35, "modes": [WorkMode.LASER, WorkMode.CNC, WorkMode.PEN], "default_power": 255
     }
 }
