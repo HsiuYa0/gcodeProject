@@ -589,19 +589,6 @@ class AdaptiveInterface(interfaces.Gcode):
     def footer(self):
         return [self.laser_off(), f"G0 X0 Y0;"]
 
-    def arc_move(self, x=None, y=None, i=None, j=None, clockwise=True):
-        # G2 是順時針，G3 是逆時針
-        command = "G2" if clockwise else "G3"
-
-        # 格式化座標與中心偏移量 (I, J)
-        coords = []
-        if x is not None: coords.append(f"X{x:.3f}")
-        if y is not None: coords.append(f"Y{y:.3f}")
-        if i is not None: coords.append(f"I{i:.3f}")  # 圓心相對起點的 X 偏移
-        if j is not None: coords.append(f"J{j:.3f}")  # 圓心相對起點的 Y 偏移
-
-        return f"{command} {' '.join(coords)};"
-
 
 def get_svg_bbox(svg_raw_str):
     # 1. 確保字串被完整的 <svg> 標籤包裹，否則解析器可能無法正確讀取路徑
