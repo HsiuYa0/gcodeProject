@@ -15,9 +15,10 @@ from shapely.geometry import Polygon, LineString, MultiLineString, MultiPolygon
 from shapely.affinity import rotate
 from shapely.ops import unary_union
 from io import StringIO  # 必須引入這個
-import subprocess
-import tempfile
-import os
+from shapely.geometry import LineString, MultiLineString, GeometryCollection
+from shapely.ops import substring
+import math
+from collections import defaultdict
 
 # from svg_to_gcode import TOLERANCES
 # TOLERANCES["operation"] = 0.2
@@ -164,8 +165,6 @@ class VTracerBinaryPipeline(SVGConversionPipeline):
 
     def _calculate_fill_lines(self, polygon_obj):
         """計算多邊形內部的填充線，並交替方向以減少空跑時間"""
-        from shapely.geometry import LineString, MultiLineString, GeometryCollection
-        from shapely.ops import substring
 
         minx, miny, maxx, maxy = polygon_obj.bounds
         diag = np.sqrt((maxx - minx) ** 2 + (maxy - miny) ** 2)
@@ -372,18 +371,206 @@ def calculate_cnc_params(tool_name, material_name):
     return int(rpm), int(feedrate)
 
 class MySmartCompiler(Compiler):
-    def append_curves(self, curves):
-        for curve in curves:
-            # 檢查 curve 是否為弧線類型 (假設你的庫有 Arc 類別)
-            if hasattr(curve, 'center') and hasattr(self.interface, 'arc_move'):
-                # 這裡直接呼叫 arc_move
-                # 你需要根據 curve 的屬性計算出 x, y, i, j
-                cmd = self.interface.arc_move(curve.end.x, curve.end.y, i, j)
-                self.body.append(cmd)
-            else:
-                # 否則退回到原本的直線近似法
-                super().append_curves([curve])
+    def __init__(self, interface_class, movement_speed, cutting_speed, pass_depth, dwell_time=0, unit=None, custom_header=None, custom_footer=None):
+        super().__init__(interface_class, movement_speed, cutting_speed, pass_depth, dwell_time, unit, custom_header, custom_footer)
 
+class GCodeOptimizer:
+    def __init__(self, stitch_tolerance=0.05):
+        self.stitch_tolerance = stitch_tolerance
+        self.machine_config = {"on_cmd": "M3", "off_cmd": "M5"}
+        self.header = []
+
+    def parse_to_fragments(self, gcode_text):
+        """對應 JS parseToFragments: 將 G-code 拆解為獨立線段"""
+        lines = gcode_text.splitlines()
+        fragments = []
+        active_frag = {"points": [], "commands": []}
+        cur_x, cur_y, cur_z = 0.0, 0.0, 0.0
+        found_motion = False
+
+        for line in lines:
+            cmd = line.strip().upper()
+            if not cmd or cmd.startswith(('(', ';')): continue
+
+            # 提取 Header
+            if not found_motion and re.search(r'G(20|21|90|91|17)', cmd):
+                self.header.append(line.strip())
+                continue
+
+            # 座標提取
+            match_x = re.search(r'X([-+]?\d*\.\d+|\d+)', cmd)
+            match_y = re.search(r'Y([-+]?\d*\.\d+|\d+)', cmd)
+            match_z = re.search(r'Z([-+]?\d*\.\d+|\d+)', cmd)
+
+            nx = float(match_x.group(1)) if match_x else cur_x
+            ny = float(match_y.group(1)) if match_y else cur_y
+            nz = float(match_z.group(1)) if match_z else cur_z
+
+            is_g0 = cmd.startswith('G0')
+            is_lift = match_z and nz > cur_z
+            is_off = "M05" in cmd or "M5" in cmd
+
+            if is_g0 or is_lift or is_off or re.search(r'G[1-3]', cmd):
+                found_motion = True
+
+            # 遇到空移或舉刀，結束當前片段
+            if (is_g0 or is_lift or is_off) and active_frag["points"]:
+                fragments.append(active_frag)
+                active_frag = {"points": [], "commands": []}
+
+            # 記錄加工路徑
+            if re.search(r'G[1-3]', cmd):
+                if not active_frag["points"]:
+                    active_frag["points"].append({"x": cur_x, "y": cur_y, "z": cur_z})
+                active_frag["points"].append({"x": nx, "y": ny, "z": nz})
+                active_frag["commands"].append(line.strip())
+
+            cur_x, cur_y, cur_z = nx, ny, nz
+
+        if active_frag["points"]: fragments.append(active_frag)
+        return fragments
+
+    def global_stitch(self, fragments):
+        """對應 JS globalStitch: 將斷開的線段縫合成完整的零件 (Parts)"""
+        pool = fragments[:]
+        parts = []
+
+        while pool:
+            active = pool.pop(0)
+            expanded = True
+            while expanded:
+                expanded = False
+                tail = active["points"][-1]
+                head = active["points"][0]
+
+                for i in range(len(pool)):
+                    target = pool[i]
+                    t_head = target["points"][0]
+                    t_tail = target["points"][-1]
+
+                    # 四種縫合情況：尾-頭, 尾-尾, 頭-尾, 頭-頭
+                    if math.hypot(tail['x'] - t_head['x'], tail['y'] - t_head['y']) < self.stitch_tolerance:
+                        active["points"] += target["points"][1:]
+                        active["commands"] += target["commands"]
+                        pool.pop(i);
+                        expanded = True;
+                        break
+                    elif math.hypot(tail['x'] - t_tail['x'], tail['y'] - t_tail['y']) < self.stitch_tolerance:
+                        active["points"] += target["points"][::-1][1:]
+                        active["commands"] += target["commands"][::-1]
+                        pool.pop(i);
+                        expanded = True;
+                        break
+
+            # 計算邊界 (Bounds)
+            pts = active["points"]
+            xs, ys = [p['x'] for p in pts], [p['y'] for p in pts]
+            active["bounds"] = {"minX": min(xs), "maxX": max(xs), "minY": min(ys), "maxY": max(ys)}
+            active["isClosed"] = math.hypot(pts[0]['x'] - pts[-1]['x'],
+                                            pts[0]['y'] - pts[-1]['y']) < self.stitch_tolerance
+            parts.append(active)
+        return parts
+
+    def sort_by_tl_chain(self, parts):
+        """對應 JS sortParts (tl-chain): 零件群組化並執行 TL-Chain 排序"""
+        # 1. 建立 Groups (大包小, 嵌套邏輯)
+        sorted_by_area = sorted(parts, key=lambda p: (p['bounds']['maxX'] - p['bounds']['minX']) * (
+                    p['bounds']['maxY'] - p['bounds']['minY']), reverse=True)
+        groups = []
+        handled = [False] * len(sorted_by_area)
+
+        for i in range(len(sorted_by_area)):
+            if handled[i]: continue
+            group = {"main": sorted_by_area[i], "children": []}
+            handled[i] = True
+            a = sorted_by_area[i]['bounds']
+            for j in range(len(sorted_by_area)):
+                if handled[j]: continue
+                b = sorted_by_area[j]['bounds']
+                if sorted_by_area[i]['isClosed'] and b['minX'] >= a['minX'] and b['maxX'] <= a['maxX'] and b['minY'] >= \
+                        a['minY'] and b['maxY'] <= a['maxY']:
+                    group["children"].append(sorted_by_area[j])
+                    handled[j] = True
+            groups.append(group)
+
+        # 2. TL-Chain 鏈式排序
+        if not groups: return []
+        sorted_groups = []
+        unvisited = groups[:]
+
+        # 初始點選擇 (Score = Y*10 - X)
+        def get_score(g):
+            first = g['children'][0] if g['children'] else g['main']
+            p = first['points'][0]
+            return (p['y'] * 10) - p['x']
+
+        start_idx = max(range(len(unvisited)), key=lambda i: get_score(unvisited[i]))
+        current = unvisited.pop(start_idx)
+        sorted_groups.append(current)
+        cur_pos = current['main']['points'][-1]
+
+        # 鏈式搜尋
+        while unvisited:
+            def dist_to_next(g):
+                first = g['children'][0] if g['children'] else g['main']
+                p = first['points'][0]
+                return math.hypot(p['x'] - cur_pos['x'], p['y'] - cur_pos['y'])
+
+            best_idx = min(range(len(unvisited)), key=lambda i: dist_to_next(unvisited[i]))
+            current = unvisited.pop(best_idx)
+            sorted_groups.append(current)
+            cur_pos = current['main']['points'][-1]
+
+        return sorted_groups
+
+
+def export_to_gcode(optimized_groups, header, rapid_f=1500, cut_f=600):
+    """
+    將優化後的 Group 數據結構轉換為可下載的 G-code 字串
+    """
+    output = ["; Optimized G-code v4.3 (Python Version)"]
+
+    # 1. 加入 Header (G21, G90 等)
+    if header:
+        output.append("\n".join(header))
+    else:
+        output.append("G21 G90")
+
+    p_num = 1
+    # 這裡假設你的 machine_config
+    on_cmd = "M3"  # 或從你的 optimizer 物件取得
+    off_cmd = "M5"  # 或從你的 optimizer 物件取得
+
+    # 2. 遍歷 Group 與 Parts
+    for group in optimized_groups:
+        # 先切 children (內孔)，最後切 main (外框)
+        all_parts = group['children'] + [group['main']]
+
+        for p in all_parts:
+            output.append(f"\n; --- Part #{p_num} ({'Closed' if p['isClosed'] else 'Open'}) ---")
+            p_num += 1
+
+            # 移動到起點 (G0)
+            start = p['points'][0]
+            output.append(f"G0 X{start['x']:.3f} Y{start['y']:.3f} F{rapid_f}")
+
+            # 下刀/開雷射
+            output.append(on_cmd)
+
+            # 寫入加工路徑指令
+            for idx, cmd in enumerate(p['commands']):
+                # 移除原始 F 值並統一插入我們設定的 cut_f
+                clean_cmd = re.sub(r'F[0-9.]+', '', cmd).strip()
+                if idx == 0:
+                    output.append(f"{clean_cmd} F{cut_f}")
+                else:
+                    output.append(clean_cmd)
+
+            # 舉刀/關雷射
+            output.append(off_cmd)
+
+    output.append("\n; --- Job Finished ---\nG0 X0 Y0\nM30")
+    return "\n".join(output)
 
 # --- 2. 自定義 Interface ---
 class AdaptiveInterface(interfaces.Gcode):
@@ -451,12 +638,6 @@ def filter_curves(curves, min_distance=0.2):
 
 # --- 3. 側邊欄 UI ---
 with st.sidebar:
-    if st.session_state.get("authenticated"):
-        if st.button("🚪 登出"):
-            cookie_manager.delete("access_token_cookie", key="logout_cookie")
-            st.session_state["authenticated"] = False
-            st.rerun()
-
     st.header("🤖 機器配置")
     
     # 使用 key 確保唯一性
@@ -715,13 +896,21 @@ if uploaded_file and machine_name != "請選擇機器...":
 
                 # 執行替換
                 final_gcode = re.sub(pattern, r"\1G0\2", final_gcode, flags=re.MULTILINE)
+
+            # --- 執行範例 ---
+            optimizer = GCodeOptimizer(stitch_tolerance=0.05)
+            frags = optimizer.parse_to_fragments(final_gcode)
+            parts = optimizer.global_stitch(frags)
+            final_groups = optimizer.sort_by_tl_chain(parts)
+            # --- 在 Streamlit 中呼叫 ---
+            gcode_string = export_to_gcode(final_groups, optimizer.header, cut_f=feedrate)
             
             st.success("🎉 格式轉換成功！")
             
             # 6. 下載與預覽
             st.download_button(
                 label="💾 下載 G-code 檔案",
-                data=final_gcode,
+                data=gcode_string,
                 file_name=f"{uploaded_file.name.split('.')[0]}.gcode",
                 mime="text/plain"
             )
