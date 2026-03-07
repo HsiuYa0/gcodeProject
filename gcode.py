@@ -538,7 +538,7 @@ def export_to_gcode(optimized_groups, header, rapid_f=1500, cut_f=600):
 
     p_num = 1
     # 這裡假設你的 machine_config
-    on_cmd = "M3"  # 或從你的 optimizer 物件取得
+    on_cmd = "M3 S255"  # 或從你的 optimizer 物件取得
     off_cmd = "M5"  # 或從你的 optimizer 物件取得
 
     # 2. 遍歷 Group 與 Parts
@@ -659,8 +659,6 @@ with st.sidebar:
             feedrate = st.number_input("進給速度 (mm/min)", value=feedrate, step=50)
             rotation_speed = st.number_input("主軸轉速 (RPM)", value=rotation_speed, step=100)
 
-        elif work_mode == WorkMode.LASER or work_mode == WorkMode.PEN:
-            feedrate = st.slider("雕刻速度 (mm/min)", 100, 5000, 1500)
         else:
             feedrate = 1500
 
@@ -671,7 +669,7 @@ with st.sidebar:
             st.subheader("🖼️ 轉檔設定")
             fill_on = st.sidebar.checkbox("啟用填滿", value=True)
             if fill_on:
-                spacing = st.sidebar.slider("填滿間隔 (mm)", 0.2, 5.0, 0.05)
+                spacing = st.sidebar.number_input("填滿間隔 (mm)", min_value=0.02, max_value=10.0, value=0.05, step=0.01)
 
         svg_converter = SVGConverter(fill_on, spacing, 0)
         # selected_pipeline = st.selectbox(
@@ -741,11 +739,11 @@ if uploaded_file and machine_name != "請選擇機器...":
     # --- 3. UI 滑桿：使用 mm 單位 ---
     col_adj1, col_adj2, col_adj3 = st.columns(3)
     with col_adj1:
-        manual_scale = st.slider("物件縮放", 0.01, 5.0, float(auto_scale_calc), 0.01)
+        manual_scale = st.number_input("物件縮放", min_value=0.01, max_value=100.0, value=float(auto_scale_calc), step=0.01)
     with col_adj2:
-        off_x_mm = st.slider("水平位移 (X mm)", -m_w_half_mm, m_w_half_mm, 0.0, 0.5)
+        off_x_mm = st.number_input("水平位移 (X mm)", min_value=-m_w_half_mm, max_value=m_w_half_mm, value=0.0, step=0.5)
     with col_adj3:
-        off_y_mm = st.slider("垂直位移 (Y mm)", -m_h_half_mm, m_h_half_mm, 0.0, 0.5)
+        off_y_mm = st.number_input("垂直位移 (Y mm)", min_value=-m_h_half_mm, max_value=m_h_half_mm, value=0.0, step=0.5)
 
     # --- 4. 座標校正與變換字串構建 (預覽用) ---
     # 【核心修正】：預覽時，所有 translate 必須是像素單位 px
