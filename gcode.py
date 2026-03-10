@@ -8,7 +8,9 @@ import abc
 import io
 from PIL import Image
 import numpy as np
-from skimage.morphology import skeletonize
+from skimage.morphology import skeletonize, binary_dilation, disk
+from skimage.feature import canny
+from scipy.ndimage import gaussian_filter
 from skimage import io as skio
 from svgelements import SVG, Path, Close, Matrix, Polygon as SVGPolygon
 from shapely.geometry import Polygon, LineString, MultiLineString, MultiPolygon
@@ -19,6 +21,15 @@ from shapely.geometry import LineString, MultiLineString, GeometryCollection
 from shapely.ops import substring
 import math
 from collections import defaultdict
+
+# Lazy-loaded neural lineart detector (downloads ~200MB model on first use)
+_lineart_detector = None
+def _get_lineart_detector():
+    global _lineart_detector
+    if _lineart_detector is None:
+        from controlnet_aux import LineartDetector
+        _lineart_detector = LineartDetector.from_pretrained("lllyasviel/Annotators")
+    return _lineart_detector
 
 # from svg_to_gcode import TOLERANCES
 # TOLERANCES["operation"] = 0.2
@@ -283,6 +294,87 @@ class SkeletonPipeline(SVGConversionPipeline):
             filter_speckle=self.filter_speckle,
             path_precision=self.path_precision
         )
+
+class LineExtractionPreprocessor:
+    """
+    Extracts line-art from a raster image using Canny edge detection + skeletonization.
+    Returns black-on-white PNG bytes ready for SVG vectorization.
+
+    density: float [0.0, 1.0]  — 0=few strong edges, 1=many fine edges
+    line_width: int [1, 3]     — 1=1-px skeleton, 3=thicker lines
+    """
+    def __init__(self, density: float = 0.5, line_width: int = 1,
+                 sigma: float = 0.5, tau: float = 0.98,
+                 threshold: float = 0.95, phi: float = 20.0):
+        self.density   = max(0.0, min(1.0, density))
+        self.line_width = max(1, min(3, line_width))
+        self.sigma     = sigma
+        self.tau       = tau
+        self.threshold = threshold
+        self.phi       = phi
+
+    def process(self, image_bytes: bytes) -> bytes:
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")
+        img_array = np.array(img, dtype=np.float64) / 255.0
+
+        # density controls edge count: low = strong edges only, high = fine detail
+        k       = 1.6 + self.density * 2.9          # 1.6 (broad) → 4.5 (fine)
+        epsilon = 0.2 - (self.density * 0.5)         # +0.2 (very few) → -0.3 (many)
+
+        g1 = gaussian_filter(img_array, sigma=self.sigma)
+        g2 = gaussian_filter(img_array, sigma=self.sigma * k)
+        dog = g1 - self.tau * g2
+
+        xdog = np.where(dog >= epsilon, 1.0, 1.0 + np.tanh(self.phi * dog))
+
+        binary_lines = xdog < self.threshold
+
+        if self.line_width > 1:
+            binary_lines = binary_dilation(binary_lines, disk(self.line_width - 1))
+
+        output_img = Image.fromarray((~binary_lines * 255).astype(np.uint8))
+        byte_io = io.BytesIO()
+        output_img.save(byte_io, format="PNG")
+        return byte_io.getvalue()
+
+
+class NeuralLineartPreprocessor:
+    """
+    Extracts clean contour lineart using a CNN (controlnet_aux LineartDetector).
+    Works well on both photos and illustrations. Model auto-downloads on first use.
+
+    coarse: bool  — False=fine detail lines, True=bold simplified contours
+    line_width: int [1, 3]  — dilation for thicker pen strokes
+    detect_resolution: int  — internal detection resolution (higher = more detail)
+    """
+    def __init__(self, coarse: bool = False, line_width: int = 1,
+                 detect_resolution: int = 512):
+        self.coarse = coarse
+        self.line_width = max(1, min(3, line_width))
+        self.detect_resolution = detect_resolution
+
+    def process(self, image_bytes: bytes) -> bytes:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        w, h = img.size
+
+        detector = _get_lineart_detector()
+        # Returns PIL image: white lines on black background
+        result = detector(img, detect_resolution=self.detect_resolution,
+                          image_resolution=max(w, h), coarse=self.coarse)
+
+        # Invert to black lines on white (matches XDoG output convention)
+        result_gray = result.convert("L")
+        result_arr = np.array(result_gray)
+        binary_lines = result_arr < 128  # white→True = line
+
+        if self.line_width > 1:
+            binary_lines = binary_dilation(binary_lines, disk(self.line_width - 1))
+
+        output_img = Image.fromarray((~binary_lines * 255).astype(np.uint8))
+        byte_io = io.BytesIO()
+        output_img.save(byte_io, format="PNG")
+        return byte_io.getvalue()
+
 
 class SVGConverter:
     def __init__(self, fill_on=False, spacing=0, angle=0):
@@ -665,9 +757,54 @@ with st.sidebar:
         # 在 Streamlit 中呼叫
         fill_on = False
         spacing = 0.05
+        line_preprocessor = None
+        with st.sidebar.expander("✏️ 線條萃取 (預處理)", expanded=False):
+            enable_line_extraction = st.checkbox("啟用線條萃取", value=False)
+            line_algo = st.radio(
+                "萃取演算法",
+                options=["神經網路輪廓線 (Neural)", "XDoG (數學)"],
+                index=0,
+                help="Neural: 乾淨輪廓，適合混合素材；XDoG: 純數學，參數可調"
+            )
+            line_width = st.select_slider("線條粗細", options=[1, 2, 3], value=1,
+                                          help="1=最細中心線，3=加粗（有助向量化）")
+
+            if line_algo == "神經網路輪廓線 (Neural)":
+                line_coarse = st.checkbox("粗線模式", value=False,
+                                          help="啟用：大範圍簡化輪廓；關閉：保留細節線條")
+                line_detect_res = st.select_slider(
+                    "偵測解析度", options=[256, 384, 512, 768], value=512,
+                    help="越高越精細，但速度較慢（首次使用需下載模型 ~200MB）"
+                )
+            else:
+                line_density = st.slider(
+                    "線條密度", min_value=0.0, max_value=1.0, value=0.5, step=0.05,
+                    help="數值越高萃取越多細節；越低只保留主要輪廓"
+                )
+                line_sigma = st.slider("模糊半徑 (Sigma)", min_value=0.3, max_value=2.0, value=0.5, step=0.1)
+                line_tau = st.slider("減法強度 (Tau)", min_value=0.90, max_value=1.00, value=0.98, step=0.01)
+                line_threshold = st.slider("二值化閾值 (Threshold)", min_value=0.50, max_value=0.99, value=0.95, step=0.01)
+                line_phi = st.slider("邊緣銳利度 (Phi)", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
+
+        if enable_line_extraction:
+            if line_algo == "神經網路輪廓線 (Neural)":
+                line_preprocessor = NeuralLineartPreprocessor(
+                    coarse=line_coarse,
+                    line_width=line_width,
+                    detect_resolution=line_detect_res
+                )
+            else:
+                line_preprocessor = LineExtractionPreprocessor(
+                    density=line_density, line_width=line_width,
+                    sigma=line_sigma, tau=line_tau,
+                    threshold=line_threshold, phi=line_phi
+                )
+        else:
+            line_preprocessor = None
+
         if work_mode == WorkMode.LASER or work_mode == WorkMode.PEN:
             st.subheader("🖼️ 轉檔設定")
-            fill_on = st.sidebar.checkbox("啟用填滿", value=True)
+            fill_on = st.sidebar.checkbox("啟用填滿", value=False)
             if fill_on:
                 spacing = st.sidebar.number_input("填滿間隔 (mm)", min_value=0.02, max_value=10.0, value=0.05, step=0.01)
 
@@ -690,6 +827,13 @@ if uploaded_file and machine_name != "請選擇機器...":
     # 1. 取得 SVG 內容
     if file_ext in ["jpg", "jpeg", "png"]:
         input_bytes = uploaded_file.getvalue()
+
+        # Line extraction preprocessing
+        if line_preprocessor is not None:
+            input_bytes = line_preprocessor.process(input_bytes)
+            st.info("預覽：線條萃取結果（此圖將進入向量化）")
+            st.image(input_bytes, caption="線條萃取預覽", use_container_width=True)
+
         # 使用 SVGConverter 進行轉檔
         svg_raw = svg_converter.convert(input_bytes, DEFAULT)
     else:

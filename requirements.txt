@@ -6,3 +6,4 @@ numpy
 scikit-image
 svgelements
 shapely
+controlnet-aux
