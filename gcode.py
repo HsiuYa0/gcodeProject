@@ -667,7 +667,7 @@ with st.sidebar:
         spacing = 0.05
         if work_mode == WorkMode.LASER or work_mode == WorkMode.PEN:
             st.subheader("🖼️ 轉檔設定")
-            fill_on = st.sidebar.checkbox("啟用填滿", value=True)
+            fill_on = st.sidebar.checkbox("啟用填滿", value=False)
             if fill_on:
                 spacing = st.sidebar.number_input("填滿間隔 (mm)", min_value=0.02, max_value=10.0, value=0.05, step=0.01)
 
@@ -882,13 +882,15 @@ if uploaded_file and machine_name != "請選擇機器...":
                 # 執行替換
                 final_gcode = re.sub(pattern, r"\1G0\2", final_gcode, flags=re.MULTILINE)
 
-            # --- 執行範例 ---
-            optimizer = GCodeOptimizer(stitch_tolerance=0.05)
-            frags = optimizer.parse_to_fragments(final_gcode)
-            parts = optimizer.global_stitch(frags)
-            final_groups = optimizer.sort_by_tl_chain(parts)
-            # --- 在 Streamlit 中呼叫 ---
-            gcode_string = export_to_gcode(final_groups, optimizer.header, cut_f=feedrate)
+                # --- 執行範例 ---
+                optimizer = GCodeOptimizer(stitch_tolerance=0.05)
+                frags = optimizer.parse_to_fragments(final_gcode)
+                parts = optimizer.global_stitch(frags)
+                final_groups = optimizer.sort_by_tl_chain(parts)
+                # --- 在 Streamlit 中呼叫 ---
+                gcode_string = export_to_gcode(final_groups, optimizer.header, cut_f=feedrate)
+            else:
+                gcode_string = final_gcode
             
             st.success("🎉 格式轉換成功！")
             
