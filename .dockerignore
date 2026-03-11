@@ -1,0 +1,10 @@
+.git
+.gitignore
+.idea
+.claude
+.devcontainer
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+gcode.py
